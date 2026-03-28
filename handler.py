@@ -154,18 +154,16 @@ def handler(event):
         rvc = get_rvc()
         rvc.load_model(model_path, index_path=index_path)
 
+        rvc.f0method = f0_method
+        rvc.f0up_key = pitch
+        rvc.index_rate = index_rate
+        rvc.filter_radius = filter_radius
+        rvc.rms_mix_rate = rms_mix_rate
+        rvc.protect = protect
+
         output_path = input_path.replace("_input.wav", "_output.wav")
         print(f"[RVC] Running inference (f0={f0_method}, pitch={pitch})...")
-        rvc.infer_file(
-            input_path,
-            output_path,
-            f0_method=f0_method,
-            f0_up_key=pitch,
-            index_rate=index_rate,
-            filter_radius=filter_radius,
-            rms_mix_rate=rms_mix_rate,
-            protect=protect,
-        )
+        rvc.infer_file(input_path, output_path)
 
         if not os.path.exists(output_path):
             return {"error": "RVC inference produced no output", "status": "failed"}

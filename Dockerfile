@@ -7,12 +7,10 @@ RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir \
     runpod \
     requests \
-    numpy \
-    scipy \
-    soundfile \
-    librosa \
-    pydub \
-    boto3
+    rvc-python \
+    huggingface_hub
+
+RUN mkdir -p /app/rvc_models
 
 COPY handler.py /app/handler.py
 

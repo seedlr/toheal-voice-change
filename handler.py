@@ -112,7 +112,8 @@ def download_model(model_name, model_url=None):
 def handler(event):
     try:
         input_data = event["input"]
-        audio_url = input_data["audio_url"]
+        audio_url = input_data.get("audio_url", "")
+        audio_base64 = input_data.get("audio_base64", "")
         model_name = input_data.get("model_name", "")
         model_url = input_data.get("model_url", "")
         pitch = input_data.get("pitch", 0)
@@ -125,14 +126,22 @@ def handler(event):
         if not model_name and not model_url:
             return {"error": "model_name or model_url is required", "status": "failed"}
 
-        print(f"[RVC] Downloading audio from {audio_url[:80]}...")
-        response = requests.get(audio_url, timeout=60)
-        if response.status_code != 200:
-            return {"error": f"Failed to download audio: HTTP {response.status_code}"}
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            temp_raw = f.name
-            f.write(response.content)
+        if audio_base64:
+            print(f"[RVC] Decoding audio from base64 ({len(audio_base64)} chars)...")
+            audio_bytes = base64.b64decode(audio_base64)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_raw = f.name
+                f.write(audio_bytes)
+        elif audio_url:
+            print(f"[RVC] Downloading audio from {audio_url[:80]}...")
+            response = requests.get(audio_url, timeout=60)
+            if response.status_code != 200:
+                return {"error": f"Failed to download audio: HTTP {response.status_code}"}
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_raw = f.name
+                f.write(response.content)
+        else:
+            return {"error": "audio_url or audio_base64 is required", "status": "failed"}
 
         input_path = temp_raw.replace(".wav", "_input.wav")
         subprocess.run(

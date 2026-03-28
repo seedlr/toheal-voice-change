@@ -5,6 +5,8 @@ import tempfile
 import base64
 import subprocess
 import glob
+import zipfile
+import shutil
 
 MODELS_DIR = "/app/rvc_models"
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -19,14 +21,66 @@ def get_rvc():
     return rvc_instance
 
 
-def download_model(model_name):
+def find_model_files(model_dir):
+    pth_files = glob.glob(os.path.join(model_dir, "**/*.pth"), recursive=True)
+    if not pth_files:
+        return None, None
+    index_files = glob.glob(os.path.join(model_dir, "**/*.index"), recursive=True)
+    return pth_files[0], index_files[0] if index_files else None
+
+
+def download_model_from_url(model_url):
+    safe_name = model_url.split("/")[-1].replace(".zip", "").replace(" ", "_")
+    model_dir = os.path.join(MODELS_DIR, safe_name)
+
+    pth, idx = find_model_files(model_dir)
+    if pth:
+        return pth, idx
+
+    os.makedirs(model_dir, exist_ok=True)
+    print(f"[RVC] Downloading model from URL: {model_url[:100]}...")
+
+    hf_token = os.environ.get("HF_TOKEN", "")
+    headers = {}
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+
+    resp = requests.get(model_url, headers=headers, timeout=120, stream=True)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Failed to download model: HTTP {resp.status_code}")
+
+    if model_url.endswith(".zip"):
+        zip_path = os.path.join(model_dir, "model.zip")
+        with open(zip_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(model_dir)
+        os.unlink(zip_path)
+    elif model_url.endswith(".pth"):
+        pth_path = os.path.join(model_dir, safe_name + ".pth")
+        with open(pth_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+    else:
+        file_path = os.path.join(model_dir, safe_name)
+        with open(file_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+    pth, idx = find_model_files(model_dir)
+    if not pth:
+        raise RuntimeError(f"No .pth file found after downloading from {model_url}")
+    return pth, idx
+
+
+def download_model_from_hf(model_name):
     safe_name = model_name.replace("/", "__")
     model_dir = os.path.join(MODELS_DIR, safe_name)
 
-    pth_files = glob.glob(os.path.join(model_dir, "**/*.pth"), recursive=True)
-    if pth_files:
-        index_files = glob.glob(os.path.join(model_dir, "**/*.index"), recursive=True)
-        return pth_files[0], index_files[0] if index_files else None
+    pth, idx = find_model_files(model_dir)
+    if pth:
+        return pth, idx
 
     os.makedirs(model_dir, exist_ok=True)
     hf_token = os.environ.get("HF_TOKEN", "")
@@ -41,12 +95,18 @@ def download_model(model_name):
     except Exception as e:
         raise RuntimeError(f"Failed to download model '{model_name}': {e}")
 
-    pth_files = glob.glob(os.path.join(model_dir, "**/*.pth"), recursive=True)
-    if not pth_files:
-        raise RuntimeError(f"No .pth file found in model '{model_name}'. Ensure the HuggingFace repo contains an RVC .pth model file.")
+    pth, idx = find_model_files(model_dir)
+    if not pth:
+        raise RuntimeError(f"No .pth file found in model '{model_name}'.")
+    return pth, idx
 
-    index_files = glob.glob(os.path.join(model_dir, "**/*.index"), recursive=True)
-    return pth_files[0], index_files[0] if index_files else None
+
+def download_model(model_name, model_url=None):
+    if model_url:
+        return download_model_from_url(model_url)
+    if model_name.startswith("http"):
+        return download_model_from_url(model_name)
+    return download_model_from_hf(model_name)
 
 
 def handler(event):
@@ -54,6 +114,7 @@ def handler(event):
         input_data = event["input"]
         audio_url = input_data["audio_url"]
         model_name = input_data.get("model_name", "")
+        model_url = input_data.get("model_url", "")
         pitch = input_data.get("pitch", 0)
         f0_method = input_data.get("f0_method", "rmvpe")
         index_rate = input_data.get("index_rate", 0.75)
@@ -61,8 +122,8 @@ def handler(event):
         rms_mix_rate = input_data.get("rms_mix_rate", 0.25)
         protect = input_data.get("protect", 0.33)
 
-        if not model_name:
-            return {"error": "model_name is required (HuggingFace repo like 'username/model-name')", "status": "failed"}
+        if not model_name and not model_url:
+            return {"error": "model_name or model_url is required", "status": "failed"}
 
         print(f"[RVC] Downloading audio from {audio_url[:80]}...")
         response = requests.get(audio_url, timeout=60)
@@ -84,8 +145,9 @@ def handler(event):
         if not os.path.exists(input_path):
             return {"error": "Failed to convert audio to WAV format", "status": "failed"}
 
-        print(f"[RVC] Downloading model '{model_name}'...")
-        model_path, index_path = download_model(model_name)
+        identifier = model_url or model_name
+        print(f"[RVC] Downloading model '{identifier[:80]}'...")
+        model_path, index_path = download_model(model_name, model_url)
         print(f"[RVC] Model: {model_path}")
         print(f"[RVC] Index: {index_path or 'none'}")
 
@@ -119,7 +181,7 @@ def handler(event):
         print(f"[RVC] Done! Output: {output_size} bytes")
         return {
             "audio_base64": audio_base64,
-            "model_used": model_name,
+            "model_used": model_name or model_url,
             "output_format": "wav",
             "output_size_bytes": output_size,
             "status": "success",

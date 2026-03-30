@@ -2,26 +2,60 @@
 RunPod Serverless Handler for RVC v2 Voice Conversion
 Downloads trained RVC models from HuggingFace on demand, caches them,
 and runs voice conversion using the RVC WebUI inference pipeline.
+
+Fixes applied:
+1. chdir to RVC_DIR so Config.load_config_json() finds configs/inuse/
+2. Set weight_root to MODELS_DIR so get_vc(filename) resolves correctly
+3. Monkey-patch argparse to prevent crash from RunPod CLI args
+4. Pass model filename (not full path) to vc.get_vc()
 """
 
-import runpod
-import torch
 import os
 import sys
-import base64
-import tempfile
-import subprocess
-import traceback
+import argparse
 
 RVC_DIR = "/workspace/RVC"
 MODELS_DIR = "/workspace/rvc_models"
 HUBERT_PATH = os.path.join(RVC_DIR, "assets", "hubert", "hubert_base.pt")
 RMVPE_PATH = os.path.join(RVC_DIR, "assets", "rmvpe.pt")
 
+os.chdir(RVC_DIR)
+
 os.environ["rmvpe_root"] = os.path.join(RVC_DIR, "assets")
-os.environ["weight_root"] = os.path.join(RVC_DIR, "assets", "weights")
+os.environ["weight_root"] = MODELS_DIR
+
+_original_parse_args = argparse.ArgumentParser.parse_args
+def _safe_parse_args(self, args=None, namespace=None):
+    try:
+        return _original_parse_args(self, args=[], namespace=namespace)
+    except Exception:
+        return argparse.Namespace(
+            port=7865, pycmd=sys.executable or "python",
+            colab=False, noparallel=True, noautoopen=True, dml=False
+        )
+argparse.ArgumentParser.parse_args = _safe_parse_args
 
 sys.path.insert(0, RVC_DIR)
+
+import runpod
+import torch
+import base64
+import tempfile
+import subprocess
+import traceback
+import shutil
+
+configs_inuse = os.path.join(RVC_DIR, "configs", "inuse")
+for sub in ["v1", "v2"]:
+    os.makedirs(os.path.join(configs_inuse, sub), exist_ok=True)
+    src_dir = os.path.join(RVC_DIR, "configs", sub)
+    if os.path.isdir(src_dir):
+        for fn in os.listdir(src_dir):
+            if fn.endswith(".json"):
+                src = os.path.join(src_dir, fn)
+                dst = os.path.join(configs_inuse, sub, fn)
+                if not os.path.exists(dst):
+                    shutil.copy2(src, dst)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 is_half = device == "cuda"
@@ -45,10 +79,7 @@ def get_vc():
 
 
 def download_model(model_url, index_url, model_name):
-    model_dir = os.path.join(MODELS_DIR, model_name)
-    os.makedirs(model_dir, exist_ok=True)
-
-    model_path = os.path.join(model_dir, f"{model_name}.pth")
+    model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
     if not os.path.exists(model_path):
         print(f"[Download] Model: {model_url}")
         result = subprocess.run(
@@ -63,7 +94,7 @@ def download_model(model_url, index_url, model_name):
     index_path = None
     if index_url:
         index_name = index_url.split("/")[-1]
-        index_path = os.path.join(model_dir, index_name)
+        index_path = os.path.join(MODELS_DIR, index_name)
         if not os.path.exists(index_path):
             print(f"[Download] Index: {index_url}")
             subprocess.run(
@@ -86,9 +117,10 @@ def load_model(model_name, model_url, index_url):
         return model_path, index_path
 
     vc = get_vc()
-    vc.get_vc(model_path)
+    pth_filename = f"{model_name}.pth"
+    vc.get_vc(pth_filename)
     current_model = model_name
-    print(f"[Model] Loaded: {model_name}")
+    print(f"[Model] Loaded: {model_name} (file={pth_filename})")
 
     return model_path, index_path
 
@@ -103,6 +135,7 @@ def handler(job):
             return {
                 "status": "healthy",
                 "gpu": torch.cuda.is_available(),
+                "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none",
                 "device": device,
                 "current_model": current_model,
             }
@@ -183,9 +216,12 @@ def handler(job):
 
 
 print(f"[Init] RVC Handler starting — device={device}, half={is_half}")
+print(f"[Init] CWD: {os.getcwd()}")
+print(f"[Init] weight_root: {os.environ.get('weight_root')}")
 print(f"[Init] HuBERT: {'OK' if os.path.exists(HUBERT_PATH) else 'MISSING'}")
 print(f"[Init] RMVPE: {'OK' if os.path.exists(RMVPE_PATH) else 'MISSING'}")
-print(f"[Init] RVC repo: {'OK' if os.path.exists(RVC_DIR) else 'MISSING'}")
+print(f"[Init] RVC repo: {'OK' if os.path.isdir(RVC_DIR) else 'MISSING'}")
+print(f"[Init] configs/inuse: {os.listdir(configs_inuse) if os.path.isdir(configs_inuse) else 'MISSING'}")
 
 get_vc()
 print("[Init] Ready for requests")

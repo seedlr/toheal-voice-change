@@ -57,6 +57,8 @@ for sub in ["v1", "v2"]:
                 if not os.path.exists(dst):
                     shutil.copy2(src, dst)
 
+os.makedirs(MODELS_DIR, exist_ok=True)
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 is_half = device == "cuda"
 
@@ -94,16 +96,19 @@ def download_model(model_url, index_url, model_name):
     index_path = None
     if index_url:
         index_name = index_url.split("/")[-1]
-        index_path = os.path.join(MODELS_DIR, index_name)
-        if not os.path.exists(index_path):
+        candidate = os.path.join(MODELS_DIR, index_name)
+        if not os.path.exists(candidate):
             print(f"[Download] Index: {index_url}")
             subprocess.run(
-                ["curl", "-sL", index_url, "-o", index_path],
+                ["curl", "-sL", index_url, "-o", candidate],
                 timeout=120, capture_output=True
             )
-            if os.path.exists(index_path):
-                size_mb = os.path.getsize(index_path) / (1024 * 1024)
-                print(f"[Download] Index saved: {size_mb:.0f} MB")
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            index_path = candidate
+            size_mb = os.path.getsize(candidate) / (1024 * 1024)
+            print(f"[Download] Index ready: {size_mb:.1f} MB")
+        else:
+            print(f"[Download] Index download failed or empty, proceeding without index")
 
     return model_path, index_path
 

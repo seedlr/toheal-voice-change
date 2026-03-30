@@ -1,7 +1,7 @@
 """
 RunPod Serverless Handler for RVC v2 Voice Conversion
-Downloads trained RVC models from HuggingFace on demand, caches them,
-and runs voice conversion using the RVC WebUI inference pipeline.
+Models are pre-baked into the Docker image. VC pipeline and a default model
+are pre-loaded during container startup for fastest cold-start response.
 
 Handles both proper inference models AND raw training checkpoints (G_*.pth).
 Raw checkpoints are auto-converted to inference format on first load.
@@ -128,7 +128,7 @@ def get_vc():
 def download_model(model_url, index_url, model_name):
     model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
     if not os.path.exists(model_path):
-        print(f"[Download] Model: {model_url}")
+        print(f"[Download] Model not baked, downloading: {model_url}")
         result = subprocess.run(
             ["curl", "-sL", model_url, "-o", model_path],
             timeout=300, capture_output=True
@@ -137,6 +137,9 @@ def download_model(model_url, index_url, model_name):
             raise RuntimeError(f"Failed to download model from {model_url}")
         size_mb = os.path.getsize(model_path) / (1024 * 1024)
         print(f"[Download] Model saved: {size_mb:.0f} MB")
+    else:
+        size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        print(f"[Model] Found baked model: {model_name} ({size_mb:.0f} MB)")
 
     needs_conversion = False
     try:
@@ -144,8 +147,6 @@ def download_model(model_url, index_url, model_name):
         if "config" not in check or "weight" not in check:
             needs_conversion = True
             print(f"[Download] Model is raw checkpoint (keys: {list(check.keys())[:5]}), converting...")
-        else:
-            print(f"[Download] Model is proper inference format")
         del check
     except Exception as e:
         print(f"[Download] Could not inspect model: {e}")
@@ -158,15 +159,13 @@ def download_model(model_url, index_url, model_name):
         index_name = index_url.split("/")[-1]
         candidate = os.path.join(MODELS_DIR, index_name)
         if not os.path.exists(candidate):
-            print(f"[Download] Index: {index_url}")
+            print(f"[Download] Index not baked, downloading: {index_url}")
             subprocess.run(
                 ["curl", "-sL", index_url, "-o", candidate],
                 timeout=120, capture_output=True
             )
         if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
             index_path = candidate
-            size_mb = os.path.getsize(candidate) / (1024 * 1024)
-            print(f"[Download] Index ready: {size_mb:.1f} MB")
         else:
             print(f"[Download] Index download failed or empty, proceeding without index")
 
@@ -283,6 +282,7 @@ def handler(job):
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
+# ── Container startup: pre-initialize everything ──
 print(f"[Init] RVC Handler starting — device={device}, half={is_half}")
 print(f"[Init] CWD: {os.getcwd()}")
 print(f"[Init] weight_root: {os.environ.get('weight_root')}")
@@ -291,7 +291,30 @@ print(f"[Init] RMVPE: {'OK' if os.path.exists(RMVPE_PATH) else 'MISSING'}")
 print(f"[Init] RVC repo: {'OK' if os.path.isdir(RVC_DIR) else 'MISSING'}")
 print(f"[Init] configs/inuse: {os.listdir(configs_inuse) if os.path.isdir(configs_inuse) else 'MISSING'}")
 
-print("[Init] VC will be lazy-initialized on first request")
+baked_models = [f for f in os.listdir(MODELS_DIR) if f.endswith('.pth')]
+print(f"[Init] Baked models ({len(baked_models)}): {', '.join(sorted(baked_models))}")
+
+print("[Init] Pre-initializing VC pipeline...")
+try:
+    get_vc()
+    print("[Init] VC pipeline ready")
+except Exception as e:
+    print(f"[Init] VC pre-init failed (will retry on first request): {e}")
+
+DEFAULT_WARMUP_MODEL = "calm_male_ar"
+warmup_pth = os.path.join(MODELS_DIR, f"{DEFAULT_WARMUP_MODEL}.pth")
+if os.path.exists(warmup_pth):
+    print(f"[Init] Pre-loading default model: {DEFAULT_WARMUP_MODEL}")
+    try:
+        vc = get_vc()
+        vc.get_vc(f"{DEFAULT_WARMUP_MODEL}.pth")
+        current_model = DEFAULT_WARMUP_MODEL
+        print(f"[Init] Default model loaded into GPU: {DEFAULT_WARMUP_MODEL}")
+    except Exception as e:
+        print(f"[Init] Default model pre-load failed (will load on first request): {e}")
+else:
+    print(f"[Init] No default warmup model found at {warmup_pth}")
+
 print("[Init] Ready for requests")
 
 runpod.serverless.start({"handler": handler})

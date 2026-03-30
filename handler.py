@@ -262,7 +262,10 @@ def handler(job):
 
             tgt_sr, audio_data = audio_opt
 
+            import numpy as np
             import soundfile as sf
+            if isinstance(audio_data, np.ndarray) and audio_data.ndim == 1:
+                audio_data = audio_data.reshape(-1, 1)
             output_path = os.path.join(tmp_dir, "output.wav")
             sf.write(output_path, audio_data, tgt_sr)
 

@@ -21,6 +21,8 @@ os.chdir(RVC_DIR)
 
 os.environ["rmvpe_root"] = os.path.join(RVC_DIR, "assets")
 os.environ["weight_root"] = MODELS_DIR
+os.environ["index_root"] = MODELS_DIR
+os.environ["outside_index_root"] = MODELS_DIR
 
 _original_parse_args = argparse.ArgumentParser.parse_args
 def _safe_parse_args(self, args=None, namespace=None):

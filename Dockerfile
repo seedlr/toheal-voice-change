@@ -34,6 +34,7 @@ RUN curl -sL https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmv
 
 RUN ls -la /workspace/RVC/assets/hubert/ && ls -la /workspace/RVC/assets/rmvpe.pt
 
+ARG HANDLER_VERSION=7
 COPY handler.py /workspace/handler.py
 
 CMD ["python", "-u", "/workspace/handler.py"]

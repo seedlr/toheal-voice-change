@@ -3,16 +3,14 @@ RunPod Serverless Handler for RVC v2 Voice Conversion
 Downloads trained RVC models from HuggingFace on demand, caches them,
 and runs voice conversion using the RVC WebUI inference pipeline.
 
-Fixes applied:
-1. chdir to RVC_DIR so Config.load_config_json() finds configs/inuse/
-2. Set weight_root to MODELS_DIR so get_vc(filename) resolves correctly
-3. Monkey-patch argparse to prevent crash from RunPod CLI args
-4. Pass model filename (not full path) to vc.get_vc()
+Handles both proper inference models AND raw training checkpoints (G_*.pth).
+Raw checkpoints are auto-converted to inference format on first load.
 """
 
 import os
 import sys
 import argparse
+from collections import OrderedDict
 
 RVC_DIR = "/workspace/RVC"
 MODELS_DIR = "/workspace/rvc_models"
@@ -62,8 +60,53 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 is_half = device == "cuda"
 
+V2_48K_CONFIG = [
+    1025, 32, 192, 192, 768, 2, 6, 3, 0, "1",
+    [3, 7, 11],
+    [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+    [12, 10, 2, 2],
+    512,
+    [24, 20, 4, 4],
+    109, 256, 48000,
+]
+
 vc_instance = None
 current_model = None
+
+
+def convert_raw_checkpoint(raw_path):
+    """Convert a raw training checkpoint (G_*.pth style) to proper RVC inference format."""
+    print(f"[Convert] Converting raw checkpoint: {raw_path}")
+    ckpt = torch.load(raw_path, map_location="cpu")
+
+    if "config" in ckpt and "weight" in ckpt:
+        print(f"[Convert] Already in inference format, skipping conversion")
+        return
+
+    if "model" in ckpt:
+        state_dict = ckpt["model"]
+    else:
+        state_dict = ckpt
+
+    opt = OrderedDict()
+    opt["weight"] = {}
+    for key in state_dict.keys():
+        if "enc_q" in key:
+            continue
+        opt["weight"][key] = state_dict[key].half()
+
+    opt["config"] = V2_48K_CONFIG
+    opt["info"] = "converted_from_raw_checkpoint"
+    opt["sr"] = "48k"
+    opt["f0"] = 1
+    opt["version"] = "v2"
+
+    converted_path = raw_path + ".converted"
+    torch.save(opt, converted_path)
+    os.replace(converted_path, raw_path)
+
+    size_mb = os.path.getsize(raw_path) / (1024 * 1024)
+    print(f"[Convert] Saved inference model: {size_mb:.1f} MB (was raw checkpoint)")
 
 
 def get_vc():
@@ -86,12 +129,27 @@ def download_model(model_url, index_url, model_name):
         print(f"[Download] Model: {model_url}")
         result = subprocess.run(
             ["curl", "-sL", model_url, "-o", model_path],
-            timeout=120, capture_output=True
+            timeout=300, capture_output=True
         )
         if result.returncode != 0 or not os.path.exists(model_path):
             raise RuntimeError(f"Failed to download model from {model_url}")
         size_mb = os.path.getsize(model_path) / (1024 * 1024)
         print(f"[Download] Model saved: {size_mb:.0f} MB")
+
+    needs_conversion = False
+    try:
+        check = torch.load(model_path, map_location="cpu")
+        if "config" not in check or "weight" not in check:
+            needs_conversion = True
+            print(f"[Download] Model is raw checkpoint (keys: {list(check.keys())[:5]}), converting...")
+        else:
+            print(f"[Download] Model is proper inference format")
+        del check
+    except Exception as e:
+        print(f"[Download] Could not inspect model: {e}")
+
+    if needs_conversion:
+        convert_raw_checkpoint(model_path)
 
     index_path = None
     if index_url:

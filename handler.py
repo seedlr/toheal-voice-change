@@ -286,7 +286,7 @@ print(f"[Init] RMVPE: {'OK' if os.path.exists(RMVPE_PATH) else 'MISSING'}")
 print(f"[Init] RVC repo: {'OK' if os.path.isdir(RVC_DIR) else 'MISSING'}")
 print(f"[Init] configs/inuse: {os.listdir(configs_inuse) if os.path.isdir(configs_inuse) else 'MISSING'}")
 
-get_vc()
+print("[Init] VC will be lazy-initialized on first request")
 print("[Init] Ready for requests")
 
 runpod.serverless.start({"handler": handler})

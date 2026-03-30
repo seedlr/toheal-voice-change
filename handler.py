@@ -1,203 +1,193 @@
+"""
+RunPod Serverless Handler for RVC v2 Voice Conversion
+Downloads trained RVC models from HuggingFace on demand, caches them,
+and runs voice conversion using the RVC WebUI inference pipeline.
+"""
+
 import runpod
-import requests
+import torch
 import os
-import tempfile
+import sys
 import base64
+import tempfile
 import subprocess
-import glob
-import zipfile
-import shutil
+import traceback
 
-MODELS_DIR = "/app/rvc_models"
-os.makedirs(MODELS_DIR, exist_ok=True)
+RVC_DIR = "/workspace/RVC"
+MODELS_DIR = "/workspace/rvc_models"
+HUBERT_PATH = os.path.join(RVC_DIR, "assets", "hubert", "hubert_base.pt")
+RMVPE_PATH = os.path.join(RVC_DIR, "assets", "rmvpe.pt")
 
-rvc_instance = None
+os.environ["rmvpe_root"] = os.path.join(RVC_DIR, "assets")
+os.environ["weight_root"] = os.path.join(RVC_DIR, "assets", "weights")
 
-def get_rvc():
-    global rvc_instance
-    if rvc_instance is None:
-        from rvc_python.infer import RVCInference
-        rvc_instance = RVCInference(device="cuda:0")
-    return rvc_instance
+sys.path.insert(0, RVC_DIR)
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+is_half = device == "cuda"
 
-def find_model_files(model_dir):
-    pth_files = glob.glob(os.path.join(model_dir, "**/*.pth"), recursive=True)
-    if not pth_files:
-        return None, None
-    index_files = glob.glob(os.path.join(model_dir, "**/*.index"), recursive=True)
-    return pth_files[0], index_files[0] if index_files else None
+vc_instance = None
+current_model = None
 
 
-def download_model_from_url(model_url):
-    safe_name = model_url.split("/")[-1].replace(".zip", "").replace(" ", "_")
-    model_dir = os.path.join(MODELS_DIR, safe_name)
+def get_vc():
+    global vc_instance
+    if vc_instance is not None:
+        return vc_instance
 
-    pth, idx = find_model_files(model_dir)
-    if pth:
-        return pth, idx
+    from configs.config import Config
+    from infer.modules.vc.modules import VC
 
+    config = Config()
+    vc_instance = VC(config)
+    print(f"[Init] VC pipeline initialized on {device}")
+    return vc_instance
+
+
+def download_model(model_url, index_url, model_name):
+    model_dir = os.path.join(MODELS_DIR, model_name)
     os.makedirs(model_dir, exist_ok=True)
-    print(f"[RVC] Downloading model from URL: {model_url[:100]}...")
 
-    hf_token = os.environ.get("HF_TOKEN", "")
-    headers = {}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
-
-    resp = requests.get(model_url, headers=headers, timeout=120, stream=True)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Failed to download model: HTTP {resp.status_code}")
-
-    if model_url.endswith(".zip"):
-        zip_path = os.path.join(model_dir, "model.zip")
-        with open(zip_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(model_dir)
-        os.unlink(zip_path)
-    elif model_url.endswith(".pth"):
-        pth_path = os.path.join(model_dir, safe_name + ".pth")
-        with open(pth_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-    else:
-        file_path = os.path.join(model_dir, safe_name)
-        with open(file_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-
-    pth, idx = find_model_files(model_dir)
-    if not pth:
-        raise RuntimeError(f"No .pth file found after downloading from {model_url}")
-    return pth, idx
-
-
-def download_model_from_hf(model_name):
-    safe_name = model_name.replace("/", "__")
-    model_dir = os.path.join(MODELS_DIR, safe_name)
-
-    pth, idx = find_model_files(model_dir)
-    if pth:
-        return pth, idx
-
-    os.makedirs(model_dir, exist_ok=True)
-    hf_token = os.environ.get("HF_TOKEN", "")
-
-    try:
-        from huggingface_hub import snapshot_download
-        snapshot_download(
-            repo_id=model_name,
-            local_dir=model_dir,
-            token=hf_token if hf_token else None,
+    model_path = os.path.join(model_dir, f"{model_name}.pth")
+    if not os.path.exists(model_path):
+        print(f"[Download] Model: {model_url}")
+        result = subprocess.run(
+            ["curl", "-sL", model_url, "-o", model_path],
+            timeout=120, capture_output=True
         )
-    except Exception as e:
-        raise RuntimeError(f"Failed to download model '{model_name}': {e}")
+        if result.returncode != 0 or not os.path.exists(model_path):
+            raise RuntimeError(f"Failed to download model from {model_url}")
+        size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        print(f"[Download] Model saved: {size_mb:.0f} MB")
 
-    pth, idx = find_model_files(model_dir)
-    if not pth:
-        raise RuntimeError(f"No .pth file found in model '{model_name}'.")
-    return pth, idx
+    index_path = None
+    if index_url:
+        index_name = index_url.split("/")[-1]
+        index_path = os.path.join(model_dir, index_name)
+        if not os.path.exists(index_path):
+            print(f"[Download] Index: {index_url}")
+            subprocess.run(
+                ["curl", "-sL", index_url, "-o", index_path],
+                timeout=120, capture_output=True
+            )
+            if os.path.exists(index_path):
+                size_mb = os.path.getsize(index_path) / (1024 * 1024)
+                print(f"[Download] Index saved: {size_mb:.0f} MB")
+
+    return model_path, index_path
 
 
-def download_model(model_name, model_url=None):
-    if model_url:
-        return download_model_from_url(model_url)
-    if model_name.startswith("http"):
-        return download_model_from_url(model_name)
-    return download_model_from_hf(model_name)
+def load_model(model_name, model_url, index_url):
+    global current_model
+
+    model_path, index_path = download_model(model_url, index_url, model_name)
+
+    if current_model == model_name:
+        return model_path, index_path
+
+    vc = get_vc()
+    vc.get_vc(model_path)
+    current_model = model_name
+    print(f"[Model] Loaded: {model_name}")
+
+    return model_path, index_path
 
 
-def handler(event):
+def handler(job):
     try:
-        input_data = event["input"]
-        audio_url = input_data.get("audio_url", "")
-        audio_base64 = input_data.get("audio_base64", "")
-        model_name = input_data.get("model_name", "")
-        model_url = input_data.get("model_url", "")
-        pitch = input_data.get("pitch", 0)
-        f0_method = input_data.get("f0_method", "rmvpe")
-        index_rate = input_data.get("index_rate", 0.75)
-        filter_radius = input_data.get("filter_radius", 3)
-        rms_mix_rate = input_data.get("rms_mix_rate", 0.25)
-        protect = input_data.get("protect", 0.33)
+        job_input = job["input"]
 
-        if not model_name and not model_url:
-            return {"error": "model_name or model_url is required", "status": "failed"}
+        action = job_input.get("action")
+        if action == "health":
+            get_vc()
+            return {
+                "status": "healthy",
+                "gpu": torch.cuda.is_available(),
+                "device": device,
+                "current_model": current_model,
+            }
 
-        if audio_base64:
-            print(f"[RVC] Decoding audio from base64 ({len(audio_base64)} chars)...")
+        audio_base64 = job_input.get("audio_base64")
+        if not audio_base64:
+            return {"error": "No audio_base64 provided"}
+
+        model_name = job_input.get("model_name")
+        model_url = job_input.get("model_url")
+        if not model_name or not model_url:
+            return {"error": "model_name and model_url required"}
+
+        index_url = job_input.get("index_url")
+        pitch = int(job_input.get("pitch", 0))
+        f0_method = job_input.get("f0_method", "rmvpe")
+        index_rate = float(job_input.get("index_rate", 0.75))
+        rms_mix_rate = float(job_input.get("rms_mix_rate", 0.25))
+        protect = float(job_input.get("protect", 0.33))
+
+        model_path, index_path = load_model(model_name, model_url, index_url)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = os.path.join(tmp_dir, "input.wav")
+
             audio_bytes = base64.b64decode(audio_base64)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                temp_raw = f.name
+            with open(input_path, "wb") as f:
                 f.write(audio_bytes)
-        elif audio_url:
-            print(f"[RVC] Downloading audio from {audio_url[:80]}...")
-            response = requests.get(audio_url, timeout=60)
-            if response.status_code != 200:
-                return {"error": f"Failed to download audio: HTTP {response.status_code}"}
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                temp_raw = f.name
-                f.write(response.content)
-        else:
-            return {"error": "audio_url or audio_base64 is required", "status": "failed"}
 
-        input_path = temp_raw.replace(".wav", "_input.wav")
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", temp_raw, "-ar", "16000", "-ac", "1", input_path],
-            capture_output=True, timeout=30
-        )
-        if os.path.exists(temp_raw) and temp_raw != input_path:
-            os.unlink(temp_raw)
+            norm_path = os.path.join(tmp_dir, "normalized.wav")
+            norm_result = subprocess.run([
+                "ffmpeg", "-y", "-i", input_path,
+                "-ar", "16000", "-ac", "1",
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                norm_path
+            ], capture_output=True, timeout=30)
 
-        if not os.path.exists(input_path):
-            return {"error": "Failed to convert audio to WAV format", "status": "failed"}
+            if norm_result.returncode == 0 and os.path.exists(norm_path):
+                input_path = norm_path
 
-        identifier = model_url or model_name
-        print(f"[RVC] Downloading model '{identifier[:80]}'...")
-        model_path, index_path = download_model(model_name, model_url)
-        print(f"[RVC] Model: {model_path}")
-        print(f"[RVC] Index: {index_path or 'none'}")
+            vc = get_vc()
+            info, audio_opt = vc.vc_single(
+                sid=0,
+                input_audio_path=input_path,
+                f0_up_key=pitch,
+                f0_file=None,
+                f0_method=f0_method,
+                file_index=index_path or "",
+                file_index2="",
+                index_rate=index_rate,
+                filter_radius=3,
+                resample_sr=0,
+                rms_mix_rate=rms_mix_rate,
+                protect=protect,
+            )
 
-        rvc = get_rvc()
-        rvc.load_model(model_path, index_path=index_path)
+            if audio_opt is None:
+                return {"error": f"Conversion returned no audio. Info: {info}"}
 
-        rvc.f0method = f0_method
-        rvc.f0up_key = pitch
-        rvc.index_rate = index_rate
-        rvc.filter_radius = filter_radius
-        rvc.rms_mix_rate = rms_mix_rate
-        rvc.protect = protect
+            tgt_sr, audio_data = audio_opt
 
-        output_path = input_path.replace("_input.wav", "_output.wav")
-        print(f"[RVC] Running inference (f0={f0_method}, pitch={pitch})...")
-        rvc.infer_file(input_path, output_path)
+            import soundfile as sf
+            output_path = os.path.join(tmp_dir, "output.wav")
+            sf.write(output_path, audio_data, tgt_sr)
 
-        if not os.path.exists(output_path):
-            return {"error": "RVC inference produced no output", "status": "failed"}
+            with open(output_path, "rb") as f:
+                result_base64 = base64.b64encode(f.read()).decode("utf-8")
 
-        with open(output_path, "rb") as f:
-            audio_base64 = base64.b64encode(f.read()).decode("utf-8")
-
-        output_size = os.path.getsize(output_path)
-
-        os.unlink(input_path)
-        os.unlink(output_path)
-
-        print(f"[RVC] Done! Output: {output_size} bytes")
-        return {
-            "audio_base64": audio_base64,
-            "model_used": model_name or model_url,
-            "output_format": "wav",
-            "output_size_bytes": output_size,
-            "status": "success",
-        }
+            return {
+                "audio_base64": result_base64,
+                "model_name": model_name,
+                "sample_rate": tgt_sr,
+                "format": "wav",
+            }
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "status": "failed"}
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
+
+print(f"[Init] RVC Handler starting — device={device}, half={is_half}")
+print(f"[Init] HuBERT: {'OK' if os.path.exists(HUBERT_PATH) else 'MISSING'}")
+print(f"[Init] RMVPE: {'OK' if os.path.exists(RMVPE_PATH) else 'MISSING'}")
+print(f"[Init] RVC repo: {'OK' if os.path.exists(RVC_DIR) else 'MISSING'}")
+
+get_vc()
+print("[Init] Ready for requests")
 
 runpod.serverless.start({"handler": handler})
